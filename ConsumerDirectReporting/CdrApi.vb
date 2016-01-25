@@ -6,6 +6,8 @@ Imports System.Dynamic
 Imports System.Security.Cryptography.X509Certificates
 Imports System.Data.SqlClient
 Imports System.Configuration
+Imports System.Text.RegularExpressions
+Imports System.Text
 
 
 
@@ -22,6 +24,37 @@ Public Class CdrApi
     Protected Shared colEmail As Integer = -1
     Protected Shared colName As Integer = -1
     Protected Shared colZip As Integer = -1
+
+    Protected Shared conn As SqlConnection
+    Protected Shared quote As String = """"
+    Protected Shared quoteFieldPattern As String = ""
+    Protected Shared quoteFieldRx As Regex = Nothing
+
+
+
+    Protected Shared Function getQuoteFieldRx() As Regex
+        If Not IsNothing(quoteFieldRx) Then
+            Return quoteFieldRx
+        End If
+        Dim sb As New StringBuilder
+        sb.Append("^(?<first>.+)")
+        sb.Append(quote).Append("(?<f1>[^,]+),(?<f2>[^""]+)").Append(quote)
+        sb.Append("(?<last>.+)$")
+        quoteFieldPattern = sb.ToString()
+     
+
+        quoteFieldRx = New Regex(quoteFieldPattern)
+        Return quoteFieldRx
+
+
+    End Function
+
+
+
+
+
+
+
 
 
     Public Shared Function getReportLines(rptId As Integer, startDate As Date, endDate As Date) As String()
@@ -233,7 +266,9 @@ Public Class CdrApi
         ' Console.WriteLine("Saving rmpList")
         CdrApi.saveRmpListToTable(rmpList)
     End Sub
-    Public Shared Sub runCustomerDetailWithGrade()
+
+
+    Public Shared Function runCustomerDetailWithGrade() As Boolean
         'Run report 132
         'For each record, get  
         '  dateRangeFilter (SmartCredit SignupDate)
@@ -245,20 +280,26 @@ Public Class CdrApi
         '  Zip - Used for exception email in case we can't match the client
         '  For no-match, send:  Name, Zip, MemberId, Signupdate
         Dim rptNo As Integer
-        rptNo = 142
+        rptNo = 132
         Dim endDate As Date = Date.Now
         Dim startDate As Date = Date.Now.AddDays(-30)
         Dim lines As String() = getReportLines(rptNo, startDate, endDate)
         If IsNothing(lines) Then
             Logger.err("Unable to create report 142")
         End If
+        Dim nLines As Integer = lines.Length
+
+        Logger.dbg("Number of report lines " & CStr(nLines))
         ' Find report columns for our data
-        
+
         ' Parse top line to find the column numbers for our data
         Dim colNames As String() = lines(0).Split(New Char() {","c})
         Dim i As Integer
-        For i = 0 To colNames.Length - 1
+        Dim nCols As Integer = colNames.Length
+        Logger.dbg("nCols = " & CStr(nCols))
+        For i = 0 To nCols - 1
             Dim cName As String = colNames(i)
+            Logger.dbg("Column number " & CStr(i) & "[" & cName & "]")
             If cName = "Member ID" Then colMemberId = i
             If cName = "dateRangeFilter" Then colSignupDate = i
             If cName = "ADID" Then colFrodoId = i
@@ -270,35 +311,54 @@ Public Class CdrApi
         '  Check for column name mismatches
         If colMemberId = -1 Then
             Logger.err("Member ID column missing")
-            Return
+            Return False
         End If
         If colSignupDate = -1 Then
             Logger.err("dateRangeFilter column missing")
-            Return
+            Return False
         End If
         If colFrodoId = -1 Then
             Logger.err("ADID column missing")
-            Return
+            Return False
         End If
         If colSignupMethod = -1 Then
             Logger.err("AID column missing")
-            Return
+            Return False
         End If
         If colEmail = -1 Then
             Logger.err("email column missing")
-            Return
+            Return False
         End If
-        If colName - -1 Then
+        If colName = -1 Then
             Logger.err("Name column missing")
-            Return
+            Return False
         End If
         If colZip = -1 Then
             Logger.err("ZIP column missing")
-            Return
+            Return False
         End If
+        conn = New SqlConnection(ConfigurationManager.ConnectionStrings("frodo").ConnectionString)
+        conn.Open()
+        Try
+            For i = 1 To nLines - 1
+                Dim line = lines(i)
+                Logger.dbg("Line number " & CStr(i) & " " & line)
+                processCustomerDetailLine(line)
+            Next
+
+        Catch ex As Exception
+            Logger.err("processCustomerDetailLine threw an exception")
+            Logger.err("  Message: " & ex.Message)
+            Logger.err(ex.StackTrace)
+            Return False
+        Finally
+            conn.Close()
 
 
-    End Sub
+        End Try
+        Return True
+
+    End Function
     Public Shared Sub processCustomerDetailLine(line As String)
         Dim signupDate As Date = Nothing
         Dim memberId As String = ""
@@ -307,6 +367,19 @@ Public Class CdrApi
         Dim email As String = ""
         Dim clientName As String = ""
         Dim zip As String = ""
+
+        'Ignore the comma in quoted fields.
+        Dim rx As Regex = getQuoteFieldRx()
+        Dim match = rx.Match(line)
+        If match.Success Then
+            Dim sb As New StringBuilder
+            sb.Append(match.Groups("first")).Append(match.Groups("f1")).Append("-----")
+            sb.Append(match.Groups("f2")).Append(match.Groups("last"))
+            Dim replacementString = sb.ToString
+            line = rx.Replace(line, replacementString)
+        End If
+
+
 
         Dim fields As String() = line.Split(New Char() {","c})
         Dim signupDateStr As String = fields(colSignupDate)
@@ -317,18 +390,20 @@ Public Class CdrApi
         signupMethod = fields(colSignupMethod)
         email = fields(colEmail)
         clientName = fields(colName)
-        zip = fields(zip)
-        If Not updateClientScData(frodoId, signupDate, memberId, signupMethod) Then
-            sendExceptionEmail(email, clientName, zip)
+        zip = fields(colZip)
+        Dim frodoIdVal As Integer
+        If Not Integer.TryParse(frodoId, frodoIdVal) Then
+            frodoIdVal = 0
+        End If
+        If Not updateClientScData(frodoIdVal, signupDate, memberId, signupMethod, email) Then
+            sendExceptionEmail(frodoIdVal, email, clientName, zip)
         End If
 
     End Sub
-    Protected Shared Function updateClientScData(frodoId As Integer, signupDate As Date, memberId As String, signupMethod As String) As Boolean
-        Dim conn As New SqlConnection(ConfigurationManager.ConnectionStrings("frodo").ConnectionString)
-        conn.Open()
+    Protected Shared Function updateClientScData(frodoId As Integer, signupDate As Date, memberId As String, signupMethod As String, email As String) As Boolean
 
         If IsNothing(signupDate) Or memberId = "" Or signupMethod = "" Then
-            Logger.err("updateClientScDate missing parameter")
+            Logger.err("updateClientScData missing parameter")
             Return False
         End If
         Dim cmd As SqlCommand = New SqlCommand("UpdateClientSCInfo", conn)
@@ -338,6 +413,7 @@ Public Class CdrApi
             .Add("@memberId", SqlDbType.VarChar).Value = memberId
             .Add("@signupDate", SqlDbType.Date).Value = signupDate
             .Add("@signupMethod", SqlDbType.VarChar).Value = signupMethod
+            .Add("@email", SqlDbType.VarChar).Value = email
         End With
         Dim paramReturnCode = cmd.Parameters.Add("@returnCode", SqlDbType.Int)
         paramReturnCode.Direction = ParameterDirection.Output
@@ -346,13 +422,17 @@ Public Class CdrApi
         Dim returnCode = paramReturnCode.Value
         If returnCode < 0 Then
             Return False
+
         End If
 
 
         Return True
 
     End Function
-    Protected Shared Sub sendExceptionEmail(email As String, clientName As String, zip As String)
+    Protected Shared Sub sendExceptionEmail(frodoId As Integer, email As String, clientName As String, zip As String)
+        clientName = clientName.Replace("-----", ",")
+        Logger.err("Unable to match frodoId = " & CStr(frodoId) & " email = " & email & " clientName = " & clientName)
+
         ' TODO
     End Sub
 

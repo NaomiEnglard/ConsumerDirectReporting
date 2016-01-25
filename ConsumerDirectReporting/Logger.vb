@@ -16,7 +16,7 @@ Public Class Logger
         Return logLevel
     End Function
 
-    Private Shared Function getCurrentLog() As String
+    Public Shared Function getCurrentLog() As String
         Dim logFileName As String = ConfigurationManager.AppSettings("LogFile")
         logLevel = ConfigurationManager.AppSettings("LogLevel")
 
@@ -28,7 +28,9 @@ Public Class Logger
         logFileName = logFileName & "." & Date.Now.ToString("yyyy.MM.dd") & ".log"
         Return logFileName
     End Function
-
+    Public Shared Function seeLog() As String
+        Return "See log file " & getCurrentLog() & " for details
+    End Function
     Private Shared Function isDebug() As Boolean
         Return getLogLevel() = LEVEL_DEBUG
     End Function
